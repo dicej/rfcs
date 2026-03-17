@@ -119,6 +119,7 @@ things:
 
 - creating, suspending, and resuming fibers
 - generating stack traces for component-level errors
+- reading from and writing to streams and futures where one end is owned by the host
 
 Fiber management could be expressed using the Stack Switching proposal, and
 indeed `lower-component` will likely have an option to use those instructions,
@@ -145,7 +146,7 @@ interface foo {
     get: func() -> u32;
   }
   
-  bar: func(v: string, s: stream<u32>) -> stream<thing>;
+  bar: async func(v: string, s: stream<u32>) -> stream<thing>;
 }
 
 world target {
@@ -173,6 +174,67 @@ void thread_new(uint32_t thread, void *context, uint32_t table, uint32_t func);
 // - `thread`: The identifier of the thread to which to switch
 __attribute__((__import_module__("env"), __import_name__("thread.switch-to")))
 void thread_switch_to(uint32_t thread);
+
+#define COPY_RESULT_BLOCKED 0xFFFFFFFF
+#define COPY_RESULT_COMPLETED 0
+#define COPY_RESULT_DROPPED 1
+#define COPY_RESULT_CANCELLED 2
+
+// Represents the result of a stream read or write.
+//
+// Note that we use a currently-hypothetical `__multivalue_return__` attribute
+// here to indicate that functions returning this type should compile to a core
+// Wasm type of e.g. `(func ... (result i32 i32))`.
+//
+// - `result`: One of the `COPY_RESULT_*` constants defined above
+// - `count`: The number of items copied, if any
+__attribute((__multivalue_return__))
+typedef struct {
+  uint32_t result;
+  size_t count;
+} result_and_count_t;
+
+// Reads from a `stream<u32>` whose write end is owned by the host.
+//
+// - `stream`: The identifier of the stream from which to read
+// - `memory`: The memory in which the buffer resides.
+// - `buffer`: The buffer to receive the items
+// - `length`: The maximum number of items which may be received
+//
+// The return value indicates the result of the operation in the same format as
+// the return value of the `stream.read` CM intrinsic.
+__attribute__((__import_module__("env"), __import_name__("stream<u32>.read")))
+result_and_count_t stream_u32_read(uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length);
+
+// As above, but for writing.
+__attribute__((__import_module__("env"), __import_name__("stream<u32>.write")))
+result_and_count_t stream_u32_write(uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length);
+
+// As above, but for `stream<thing>`, where `thing` is the _imported_ resource
+// type.
+__attribute__((__import_module__("env"), __import_name__("stream<import example:package/foo#thing>.read")))
+result_and_count_t stream_import_example_package_foo_thing_read(
+  uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length
+);
+
+// As above, but for writing.
+__attribute__((__import_module__("env"), __import_name__("stream<import example:package/foo#thing>.write")))
+result_and_count_t stream_import_example_package_foo_thing_write(
+  uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length
+);
+
+// As above, but for `stream<thing>`, where `thing` is the _exported_ resource
+// type.
+__attribute__((__import_module__("env"), __import_name__("stream<export example:package/foo#thing>.read")))
+result_and_count_t stream_export_example_package_foo_thing_read(
+  uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length
+);
+
+// As above, but for writing.
+__attribute__((__import_module__("env"), __import_name__("stream<export example:package/foo#thing>.write")))
+result_and_count_t stream_export_example_package_foo_thing_write(
+  uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length
+);
 
 // The remaining functions listed here are (eventually) intended to match the
 // imports a C binding generator would generate per the proposed
@@ -206,16 +268,29 @@ uint32_t import_example_package_foo_thing_get(uint32_t handle);
 __attribute__((__import_module__("example:package/foo"), __import_name__("[resource-drop]thing")))
 void import_example_package_foo_thing_drop(uint32_t handle);
 
+#define TASK_STATUS_STARTING 0
+#define TASK_STATUS_STARTED 1
+#define TASK_STATUS_RETURNED 2
+#define TASK_STATUS_START_CANCELLED 3
+#define TASK_STATUS_RETURN_CANCELLED 4
+
 // Imported `bar` function.
 //
-// - `v_memory`: The memory to which `v_ptr` points
+// - `task`: The identifier used to refer to the host task hereafter
+// - `memory`: The memory to which `v_ptr` and `return_ptr` pointers point
 // - `v_ptr`: A pointer to the UTF-8-encoded string representing the `v` parameter
 // - `v_len`: The length, in bytes of the encode string
 // - `s`: `stream<u32>` parameter
+// - `return_ptr`: A pointer to space reserved to receive the result `stream<thing>`
 //
-// Returns the `stream<thing>` result where `thing` is the _imported_ resource.
+// Returns the status of the call (see the `TASK_STATUS_*` constants above).
+//
+// Note that this signature differs from what the Guest C ABI would specify given
+// that the guest is responsible for allocating a task handle.
 __attribute__((__import_module__("example:package/foo"), __import_name__("bar")))
-uint32_t import_example_package_foo_bar(uint32_t v_memory, uint8_t *v_ptr, size_t v_len, s: uint32_t);
+uint32_t import_example_package_foo_bar(
+  uint32_t task, uint32_t memory, uint8_t *v_ptr, size_t v_len, uint32_t s, uint32_t *return_ptr
+);
 ```
 
 ### Host->Guest API
@@ -278,62 +353,10 @@ writer_reader_pair_t stream_import_example_package_foo_thing_new();
 __attribute__((__export_name__("stream<export example:package/foo#[constructor]thing>.new")))
 writer_reader_pair_t stream_export_example_package_foo_thing_new();
 
-// Represents the result of a stream read or write.
-//
-// Note that we use a currently-hypothetical `__multivalue_return__` attribute
-// here to indicate that functions returning this type should compile to a core
-// Wasm type of e.g. `(func ... (result i32 i32))`.
-__attribute((__multivalue_return__))
-typedef struct {
-  uint32_t result;
-  size_t count;
-} result_and_count_t;
-
-// Reads from a `stream<u32>` whose write end is owned by the guest.
-//
-// - `stream`: The identifier of the stream from which to read
-// - `memory`: The memory in which the buffer resides
-// - `buffer`: The buffer to receive the items
-// - `length`: The maximum number of items which may be received
-//
-// The return value indicates the result of the operation in the same format as
-// the return value of the `stream.read` CM intrinsic.
-__attribute__((__export_name__("stream<u32>.read")))
-result_and_count_t stream_u32_read(uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length);
-
-// As above, but for writing.
-__attribute__((__export_name__("stream<u32>.write")))
-result_and_count_t stream_u32_write(uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length);
-
-// As above, but for `stream<thing>`, where `thing` is the _imported_ resource
-// type.
-__attribute__((__export_name__("stream<import example:package/foo#thing>.read")))
-result_and_count_t stream_import_example_package_foo_thing_read(
-  uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length
-);
-
-// As above, but for writing.
-__attribute__((__export_name__("stream<import example:package/foo#thing>.write")))
-result_and_count_t stream_import_example_package_foo_thing_write(
-  uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length
-);
-
-// As above, but for `stream<thing>`, where `thing` is the _exported_ resource
-// type.
-__attribute__((__export_name__("stream<export example:package/foo#thing>.read")))
-result_and_count_t stream_export_example_package_foo_thing_read(
-  uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length
-);
-
-// As above, but for writing.
-__attribute__((__export_name__("stream<export example:package/foo#thing>.write")))
-result_and_count_t stream_export_example_package_foo_thing_write(
-  uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length
-);
-
 // The remaining functions listed here are (eventually) intended to match the
 // imports a C binding generator would generate per the proposed
-// [Guest C ABI](https://github.com/WebAssembly/component-model/pull/378).
+// [Guest C ABI](https://github.com/WebAssembly/component-model/pull/378), with
+// possible exceptions as noted.
 
 // Constructor for the _exported_ resource `thing`
 //
@@ -357,16 +380,41 @@ uint32_t example_package_foo_thing_get(uint32_t handle);
 __attribute__((__export_name__("example:package/foo#[dtor]thing")))
 void example_package_foo_thing_dtor(uint32_t handle);
 
+#define CALLBACK_CODE_EXIT 0
+#define CALLBACK_CODE_YIELD 1
+#define CALLBACK_CODE_WAIT 2
+
+// Represents the result of a call to an async export
+//
+// - `code`: One of the `CALLBACK_CODE_*` constants defined above
+// - `task`: The task identifier if `code != CALLBACK_CODE_EXIT`
+// - `waitables_ptr`: The `waitable`s on which to wait if `code == CALLBACK_CODE_WAIT`
+// - `waitables_len`: The number of `waitable`s stored in `waitables_ptr`
+//
+// Note that this differs from what the Guest C ABI would describe given that
+// here the guest is responsible for managing waitable handles.
+__attribute((__multivalue_return__))
+typedef struct {
+  uint32_t code;
+  uint32_t task;
+  uint32_t *waitables_ptr;
+  size_t waitables_len;
+} task_status_t;
+
 // Exported `bar` function.
 //
-// - `v_memory`: The memory to which `v_ptr` points
+// - `memory`: The memory to which `v_ptr` points
+// - `memory`: The memory to which `v_ptr` and `return_ptr` pointers point
 // - `v_ptr`: A pointer to the UTF-8-encoded string representing the `v` parameter
 // - `v_len`: The length, in bytes of the encode string
 // - `s`: `stream<u32>` parameter
+// - `return_ptr`: A pointer to space reserved to receive the result `stream<thing>`
 //
-// Returns the `stream<thing>` result where `thing` is the _exported_ resource.
+// Returns the status of the task.
 __attribute__((__export_name__("example:package/foo#bar")))
-uint32_t example_package_foo_bar(uint32_t v_memory, uint8_t *v_ptr, size_t v_len, s: uint32_t);
+task_status_t example_package_foo_bar(
+  uint32_t memory, uint8_t *v_ptr, size_t v_len, uint32_t s, uint32_t *return_ptr
+);
 ```
 
 ## `host-wit-bindgen`
@@ -406,6 +454,9 @@ Given that a C API doesn't make sense in e.g. a web browser, this could be
 mirrored as a JS API for use in JS-embedded runtimes.
 
 ```
+// Note that we disregard error handling (and, to some extent, efficiency)
+// for simplicity in the following API sketch.
+
 // Represents a runtime store in which one or more modules may be instantiated.
 typedef struct {
   void *ptr;
@@ -414,9 +465,7 @@ typedef struct {
 // Create a new store.
 //
 // - `data`: Application-specific data to be associated with the store
-//
-// Returns the newly-created store.
-store_t new_store(void *data);
+store_t store_new(void *data);
 
 // Get the application-specific data from the store.
 //
@@ -428,7 +477,129 @@ void *store_data(store_t store);
 // Dispose of the specified store.
 void store_drop(store_t store);
 
-// tbc
+// Represents a linker to which host-defined functions may be added.
+typedef struct {
+  void *ptr;
+} linker_t;
+
+// Create a new linker.
+linker_t linker_new();
+
+// Represents a core Wasm value.
+typedef union {
+  uint32_t u32;
+  uint64_t u64;
+  float f32;
+  double f64;
+} value_t;
+
+// Represents a host-defined function.
+//
+// - `store`: The store to which the calling instance belongs
+// - `instance`: The calling instance
+// - `param_ptr`: A buffer containing the function parameters
+// - `param_len`: The number of function parameters
+// - `result_ptr`: A buffer to receive the function results
+// - `result_len`: The capacity of the result buffer
+typedef void (*host_function_t)(
+  store_t store,
+  instance_t instance,
+  value_t *param_ptr,
+  size_t param_len,
+  value_t *result_ptr,
+  size_t result_len
+);
+
+// Add the specified function to the linker.
+//
+// - `linker`: The linker to which the function will be added
+// - `module`: The name of the module from which the function may be imported
+// - `name`: The name of the function to add
+// - `func`: The function to add
+void linker_add(linker_t linker, const char *module, const char *name, host_function_t func);
+
+// Dispose of the specified linker.
+void linker_drop(linker_t linker);
+
+// Represents an instantiated and linked module.
+typedef struct {
+  void *ptr;
+} instance_t;
+
+// Create a new instance.
+//
+// - `store`: The store in which the instance will be created
+// - `linker`: The linker containing any host functions for the instance to import
+// - `module`: The Wasm module to instantiate
+instance_t instance_new(store_t store, linker_t linker, uint8_t *module);
+
+// Call an exported function in the specified instance
+//
+// - `store`: The store to which the instance belongs
+// - `instance`: The instance in which the function is exported
+// - `name`: The name of the export
+// - `param_ptr`: A buffer containing the function parameters
+// - `param_len`: The number of function parameters
+// - `result_ptr`: A buffer to receive the function results
+// - `result_len`: The capacity of the result buffer
+void instance_call(
+  store_t store,
+  instance_t instance,
+  const char *name,
+  value_t *param_ptr,
+  size_t param_len,
+  value_t *result_ptr,
+  size_t result_len
+);
+
+// Retrieve the value of the specified global variable.
+//
+// - `store`: The store to which the instance belongs
+// - `instance`: The instance in which the global resides
+// - `index`: The index of the global variable
+value_t instance_get_global(store_t store, instance_t instance, uint32_t index);
+
+// Set the value of the specified global variable.
+//
+// - `store`: The store to which the instance belongs
+// - `instance`: The instance in which the global resides
+// - `index`: The index of the global variable
+// - `value`: The value to set
+void instance_set_global(store_t store, instance_t instance, uint32_t index, value_t value);
+
+// Represents the result of an `instance_get_memory` call.
+typedef struct {
+  uint8_t *ptr;
+  size_t len;
+} memory_result_t;
+
+// Retrieve a pointer to the specified memory.
+//
+// - `store`: The store to which the instance belongs
+// - `instance`: The instance in which the memory resides
+// - `index`: The index of the memory
+memory_result_t instance_get_memory(store_t store, instance_t instance, uint32_t index);
+
+// Represents a store-managed fiber.
+typedef struct {
+  void *ptr;
+} fiber_t;
+
+// Create a new fiber.
+//
+// - `store`: The store in which the fiber will be created
+// - `context`: Application-defined state to be passed to `func`
+// - `func`: Function to call when the fiber is resumed for the first time
+fiber_t fiber_new(store_t store, void *context, void (*func)(void*));
+
+// Pass control to the specified fiber.
+//
+// - `store`: The store to which the fiber belongs
+// - `fiber`: The fiber to resume
+void fiber_resume(store_t store, fiber_t fiber);
+
+// Suspend the currently running fiber.
+void fiber_suspend();
 ```
 
 # Rationale and alternatives
