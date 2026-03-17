@@ -118,6 +118,7 @@ all operations in core Wasm, and therefore must use intrinsics for certain
 things:
 
 - creating, suspending, and resuming fibers
+- polling or waiting for one or more host events
 - generating stack traces for component-level errors
 - reading from and writing to streams and futures where one end is owned by the host
 
@@ -159,15 +160,31 @@ The following is a sketch of the API imported by such a lowered component as a
 set of C functions.  Here we assume that the component explicitly creates and
 switches between thread, and thus must import intrinsics from the host to do so.
 
-```
+Note that all of the following types and functions are (eventually) intended to
+match the imports a C binding generator would generate per the proposed [Guest C
+ABI](https://github.com/WebAssembly/component-model/pull/378).
+
+
+```c
+// The types and functions in this code block are based on a subset of the
+// intrinsics defined by the
+// [Component Model ABI](https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md),
+// with modifications in some cases to represent e.g. memory and table indexes
+// as runtime values rather than component-level declarations.
+
 // Creates a new thread, initially in a "suspended" state.
 //
-// - `thread`: The identifier used to refer to the thread hereafter
 // - `context`: The value to pass to the function in the new thread
 // - `table`: The table in which to find the function
 // - `func`: The function to call, of type `(func (param i32))`
+//
+// Returns the host-defined identifier for the newly-created thread.
 __attribute__((__import_module__("env"), __import_name__("thread.new")))
-void thread_new(uint32_t thread, void *context, uint32_t table, uint32_t func);
+uint32_t thread_new(void *context, uint32_t table, uint32_t func);
+
+// Retrieves the identifier for the currently-running thread.
+__attribute__((__import_module__("env"), __import_name__("thread.index")))
+uint32_t thread_index();
 
 // Switch to the specified thread, suspending the current one.
 //
@@ -175,16 +192,99 @@ void thread_new(uint32_t thread, void *context, uint32_t table, uint32_t func);
 __attribute__((__import_module__("env"), __import_name__("thread.switch-to")))
 void thread_switch_to(uint32_t thread);
 
+// Retrieve the zeroth thread-local context variable.
+__attribute__((__import_module__("env"), __import_name__("context[0].get")))
+uint32_t context0_get();
+
+// Set the zeroth thread-local context variable.
+__attribute__((__import_module__("env"), __import_name__("context[0].set")))
+void context0_set(uint32_t value);
+
+// Creates a new `waitable-set`.
+__attribute__((__import_module__("env"), __import_name__("waitable-set.new")))
+uint32_t waitable_set_new();
+
+// Add the specified `waitable` to the specified `set` (or remove it from any set
+// if zero).
+//
+// - `waitable`: The `waitable` to add or remove
+// - `set`: The set to which to add the `waitable`, or zero if the `waitable` is
+//   to be removed
+__attribute__((__import_module__("env"), __import_name__("waitable.join")))
+uint32_t waitable_join(uint32_t waitable, uint32_t set);
+
+#define EVENT_NONE 0
+#define EVENT_SUBTASK 1
+#define EVENT_STREAM_READ 2
+#define EVENT_STREAM_WRITE 3
+#define EVENT_FUTURE_READ 4
+#define EVENT_FUTURE_WRITE 5
+#define EVENT_CANCELLED 6
+
+// Represents the result of a call to `waitable-set.{wait,poll}`
+//
+// - `event`: One of the `EVENT_*` constants defined above
+// - `waitable`: `waitable` to which the event pertains, if any
+// - `payload`: Event-specific payload, if any
+//
+// Note that we use a currently-hypothetical `__multivalue_return__` attribute
+// here to indicate that functions returning this type should compile to a core
+// Wasm type of e.g. `(func ... (result i32 i32))`.
+__attribute((__multivalue_return__))
+typedef struct {
+  uint32_t event;
+  uint32_t waitable;
+  uint32_t payload;
+} wait_result_t;
+
 #define COPY_RESULT_BLOCKED 0xFFFFFFFF
 #define COPY_RESULT_COMPLETED 0
 #define COPY_RESULT_DROPPED 1
 #define COPY_RESULT_CANCELLED 2
 
-// Represents the result of a stream read or write.
+// Blocks the calling fiber until the specified `waitable-set` has an event.
 //
-// Note that we use a currently-hypothetical `__multivalue_return__` attribute
-// here to indicate that functions returning this type should compile to a core
-// Wasm type of e.g. `(func ... (result i32 i32))`.
+// - `set`: The `waitable-set` to wait for
+__attribute__((__import_module__("env"), __import_name__("waitable-set.wait")))
+wait_result_t waitable_set_wait(uint32_t set);
+
+// Polls the specified `waitable-set` to determine if it has any pending events.
+//
+// - `set`: The `waitable-set` to poll
+__attribute__((__import_module__("env"), __import_name__("waitable-set.wait")))
+wait_result_t waitable_set_poll(uint32_t set);
+
+// Represents the write- and read-ends of a `stream` or `future`.
+__attribute((__multivalue_return__))
+typedef struct {
+  uint32_t writer;
+  uint32_t reader;
+} writer_reader_pair_t;
+
+// Constructs a new `stream<u32>`.
+//
+// Note that the guest would only call this when it intends to give the readable
+// end to the host at some point.  It would _not_ be called for guest-to-guest
+// streams (except to "upgrade" such a stream to one which can be passed to the
+// host) since those are managed internally by the guest.
+//
+// Returns the (writer, reader) pair.
+__attribute__((__import_module__("env"), __import_name__("stream<u32>.new")))
+writer_reader_pair_t stream_u32_new();
+
+// Constructs a new `stream<thing>`, where `thing` is the _imported_ resource.
+//
+// Returns the (writer, reader) pair.
+__attribute__((__import_module__("env"), __import_name__("stream<import example:package/foo#[constructor]thing>.new")))
+writer_reader_pair_t stream_import_example_package_foo_thing_new();
+
+// Constructs a new `stream<thing>`, where `thing` is the _exported_ resource.
+//
+// Returns the (writer, reader) pair.
+__attribute__((__import_module__("env"), __import_name__("stream<export example:package/foo#[constructor]thing>.new")))
+writer_reader_pair_t stream_export_example_package_foo_thing_new();
+
+// Represents the result of a stream read or write.
 //
 // - `result`: One of the `COPY_RESULT_*` constants defined above
 // - `count`: The number of items copied, if any
@@ -204,11 +304,15 @@ typedef struct {
 // The return value indicates the result of the operation in the same format as
 // the return value of the `stream.read` CM intrinsic.
 __attribute__((__import_module__("env"), __import_name__("stream<u32>.read")))
-result_and_count_t stream_u32_read(uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length);
+result_and_count_t stream_u32_read(
+  uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length
+);
 
-// As above, but for writing.
+// As above, but for writing to a stream whose read end is owned by the host.
 __attribute__((__import_module__("env"), __import_name__("stream<u32>.write")))
-result_and_count_t stream_u32_write(uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length);
+result_and_count_t stream_u32_write(
+  uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length
+);
 
 // As above, but for `stream<thing>`, where `thing` is the _imported_ resource
 // type.
@@ -236,23 +340,48 @@ result_and_count_t stream_export_example_package_foo_thing_write(
   uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length
 );
 
-// The remaining functions listed here are (eventually) intended to match the
-// imports a C binding generator would generate per the proposed
-// [Guest C ABI](https://github.com/WebAssembly/component-model/pull/378), with
-// possible exceptions as noted.
+// Creates a new host-defined handle for an object of the _exported_ resource
+// type `thing`.
+//
+// Note that the guest would only call this when it intends to pass the handle
+// to the host (by own or borrow) at some point.  It would _not_ be used for
+// guest-to-guest calls, in which case everything would be managed internally
+// by the guest.
+__attribute__(( __import_module__("[export]example:package/foo"), __import_name__("[resource-new]thing")))
+extern uint32_t __wasm_import_exports_foo_bar_my_interface_thing_new(uint32_t v);
+
+// Returns the guest-side representation for a handle to an object of the
+// _exported_ resource type `thing`.
+__attribute__((__import_module__("[export]example:package/foo"), __import_name__("[resource-rep]thing")))
+extern uint32_t __wasm_import_exports_foo_bar_my_interface_thing_rep(uint32_t);
+
+// Drops the handle to an object of the _exported_ resource type `thing`, making
+// it invisible to the host.
+__attribute__((__import_module__("[export]example:package/foo"), __import_name__("[resource-drop]thing")))
+extern void __wasm_import_exports_foo_bar_my_interface_thing_drop(int32_t handle);
+
+// Returns a value from the _exported_ `bar` function.
+//
+// - `value`: The value to return.
+__attribute__((__import_module__("[export]example:package/foo"), __import_name__("[task-return]bar")))
+void __wasm_export_exports_foo_bar_my_interface_bar__task_return(uint32_t value);
+
+// Confirms cancellation of an earlier call to the _exported_ `bar` function.
+__attribute__((__import_module__("[export]example:package/foo"), __import_name__("[task-cancel]bar")))
+void __wasm_export_exports_foo_bar_my_interface_bar__task_cancel();
+```
+
+```c
+// The types and functions in this code block represent normal, non-intrinsic
+// imports of the target world.
 
 // Constructor for the _imported_ resource `thing`.
 //
-// - `handle`: The identifier used to refer to the object hereafter
 // - `v`: The constructor's `u32` parameter
 //
-// Note that the signature here differs slightly from the Guest C ABI since in
-// this scenario the guest is responsible for allocating resource handles.  We
-// _could_ make it match the Guest C ABI by having it return a handle instead of
-// taking it as a parameter, but that would require the host to reenter the
-// guest to allocate a handle before returning.
+// Returns the host-defined identifier for the newly-created object
 __attribute__((__import_module__("example:package/foo"), __import_name__("[constructor]thing")))
-void import_example_package_foo_constructor_thing(uint32_t handle, uint32_t v);
+uint32_t import_example_package_foo_constructor_thing(uint32_t v);
 
 // `get` method for the _imported_ resource `thing`.
 //
@@ -274,22 +403,28 @@ void import_example_package_foo_thing_drop(uint32_t handle);
 #define TASK_STATUS_START_CANCELLED 3
 #define TASK_STATUS_RETURN_CANCELLED 4
 
+// Represents the result of a call to an async-lowered function import.
+//
+// - `status`: One of the `TASK_STATUS_*` constants defined above
+// - `task`: The host-defined identifier for the task, if `status < 2`
+__attribute((__multivalue_return__))
+typedef struct {
+  uint32_t status;
+  uint32_t task;
+} task_result_t;
+
 // Imported `bar` function.
 //
-// - `task`: The identifier used to refer to the host task hereafter
 // - `memory`: The memory to which `v_ptr` and `return_ptr` pointers point
 // - `v_ptr`: A pointer to the UTF-8-encoded string representing the `v` parameter
 // - `v_len`: The length, in bytes of the encode string
 // - `s`: `stream<u32>` parameter
 // - `return_ptr`: A pointer to space reserved to receive the result `stream<thing>`
 //
-// Returns the status of the call (see the `TASK_STATUS_*` constants above).
-//
-// Note that this signature differs from what the Guest C ABI would specify given
-// that the guest is responsible for allocating a task handle.
+// Returns the result of the call as a `task_result_t`.
 __attribute__((__import_module__("example:package/foo"), __import_name__("bar")))
-uint32_t import_example_package_foo_bar(
-  uint32_t task, uint32_t memory, uint8_t *v_ptr, size_t v_len, uint32_t s, uint32_t *return_ptr
+task_result_t import_example_package_foo_bar(
+  uint32_t memory, uint8_t *v_ptr, size_t v_len, uint32_t s, uint32_t *return_ptr
 );
 ```
 
@@ -307,7 +442,11 @@ used by the world targeted by the component, as well as which interfaces and
 functions are exported.  The following is a sketch of the API exported by the
 hypothetical lowered component we presented in the previous section:
 
-```
+Again, all of the following types and functions are (eventually) intended to
+match the imports a C binding generator would generate per the proposed [Guest C
+ABI](https://github.com/WebAssembly/component-model/pull/378).
+
+```c
 // (Re)allocates from the specified guest memory.
 //
 // - `memory`: The index of the memory from which to allocate
@@ -323,40 +462,6 @@ hypothetical lowered component we presented in the previous section:
 // arrives.
 __attribute__((__export_name__("cabi_realloc")))
 void *cabi_realloc(uint32_t memory, void *ptr, size_t old_size, size_t align, size_t new_size);
-
-// Represents the write- and read-ends of a `stream` or `future`.
-//
-// Note that we use a currently-hypothetical `__multivalue_return__` attribute
-// here to indicate that functions returning this type should compile to a core
-// Wasm type of e.g. `(func ... (result i32 i32))`.
-__attribute((__multivalue_return__))
-typedef struct {
-  uint32_t writer;
-  uint32_t reader;
-} writer_reader_pair_t;
-
-// Constructs a new `stream<u32>`.
-//
-// Returns the (writer, reader) pair.
-__attribute__((__export_name__("stream<u32>.new")))
-writer_reader_pair_t stream_u32_new();
-
-// Constructs a new `stream<thing>`, where `thing` is the _imported_ resource.
-//
-// Returns the (writer, reader) pair.
-__attribute__((__export_name__("stream<import example:package/foo#[constructor]thing>.new")))
-writer_reader_pair_t stream_import_example_package_foo_thing_new();
-
-// Constructs a new `stream<thing>`, where `thing` is the _exported_ resource.
-//
-// Returns the (writer, reader) pair.
-__attribute__((__export_name__("stream<export example:package/foo#[constructor]thing>.new")))
-writer_reader_pair_t stream_export_example_package_foo_thing_new();
-
-// The remaining functions listed here are (eventually) intended to match the
-// imports a C binding generator would generate per the proposed
-// [Guest C ABI](https://github.com/WebAssembly/component-model/pull/378), with
-// possible exceptions as noted.
 
 // Constructor for the _exported_ resource `thing`
 //
@@ -387,23 +492,15 @@ void example_package_foo_thing_dtor(uint32_t handle);
 // Represents the result of a call to an async export
 //
 // - `code`: One of the `CALLBACK_CODE_*` constants defined above
-// - `task`: The task identifier if `code != CALLBACK_CODE_EXIT`
-// - `waitables_ptr`: The `waitable`s on which to wait if `code == CALLBACK_CODE_WAIT`
-// - `waitables_len`: The number of `waitable`s stored in `waitables_ptr`
-//
-// Note that this differs from what the Guest C ABI would describe given that
-// here the guest is responsible for managing waitable handles.
+// - `waitable_set`: The `waitable-set` on which to wait if `code == CALLBACK_CODE_WAIT`
 __attribute((__multivalue_return__))
 typedef struct {
   uint32_t code;
-  uint32_t task;
-  uint32_t *waitables_ptr;
-  size_t waitables_len;
+  uint32_t waitable_set;
 } task_status_t;
 
 // Exported `bar` function.
 //
-// - `memory`: The memory to which `v_ptr` points
 // - `memory`: The memory to which `v_ptr` and `return_ptr` pointers point
 // - `v_ptr`: A pointer to the UTF-8-encoded string representing the `v` parameter
 // - `v_len`: The length, in bytes of the encode string
@@ -411,10 +508,21 @@ typedef struct {
 // - `return_ptr`: A pointer to space reserved to receive the result `stream<thing>`
 //
 // Returns the status of the task.
-__attribute__((__export_name__("example:package/foo#bar")))
+__attribute__((__export_name__("[async-lift]example:package/foo#bar")))
 task_status_t example_package_foo_bar(
   uint32_t memory, uint8_t *v_ptr, size_t v_len, uint32_t s, uint32_t *return_ptr
 );
+
+// Callback for exported `bar` function.
+//
+// - `event`: The event to be delivered
+// - `waitable`: `waitable` to which the event pertains, if any
+// - `payload`: Event-specific payload, if any
+__attribute__((__export_name__("[callback][async-lift]example:package/foo#bar")))
+task_status_t example_package_foo_bar_callback(
+  uint32_t event, uint32_t waitable, uint32_t payload
+);
+
 ```
 
 ## `host-wit-bindgen`
