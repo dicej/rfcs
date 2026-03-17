@@ -78,10 +78,10 @@ That runtime code will itself make use of intrinsic functions imported from the
 host in order to do things only the host can do, e.g. create, suspend, and
 resume fibers and collect error backtraces.  See the next section for details.
 
-In the case of component-level exports which involve stream and/or future types,
-the generated module would include function exports which the host may call to
-create new values of those types.  This is necessary because the tables for such
-values are managed internally by the guest, not by the host.
+In the case of component-level interfaces which involve resource, stream and/or
+future types, the generated module would include function exports which the host
+may call to create new values of those types.  This is necessary because the
+tables for such values are managed internally by the guest, not by the host.
 
 ### Multiply-instantiated Modules
 
@@ -99,15 +99,25 @@ instantiate the same module more than once.  In that case, we have three options
   and link them together.
     - This would require specifying how that metadata is represented and how the
       whole combination of modules+metadata should be packaged.
+
+Regarding the third option: one possibility would be to define a minimal subset
+of the component model which only supports declaring, linking, and instantiating
+core modules and use that to package the modules.
   
 ## Host C API for Lowered Components
+
+This API includes two parts:
+
+- Imported functions called by the guest and provided by the host
+- Exported functions called by the host and provided by the guest
+
+### Guest->Host API
 
 As mentioned above, modules produced using `lower-component` can't (yet) express
 all operations in core Wasm, and therefore must use intrinsics for certain
 things:
 
 - creating, suspending, and resuming fibers
-- reading and writing fiber-local state
 - generating stack traces for component-level errors
 
 Fiber management could be expressed using the Stack Switching proposal, and
@@ -120,8 +130,243 @@ Note that these intrinsics need not be implemented in C, nor a language with
 native support for the Wasm C ABI; we simply use C as a way to represent an ABI
 in a familiar, human-readable format.
 
+Finally, note that the exact set of functions imported by a given lowered
+component will depend on which intrinsics it actually needs, which stream and
+future types are used in the world it targets, and which interfaces and
+functions are imported by the world.  For example, imagine we've lowered a
+component which targets the following WIT world:
+
 ```
-(TODO: Sketch the proposed API)
+package example:package;
+
+interface foo {
+  resource thing {
+    constructor(v: u32);
+    get: func() -> u32;
+  }
+  
+  bar: func(v: string, s: stream<u32>) -> stream<thing>;
+}
+
+world target {
+  import foo;
+  export foo;
+}
+```
+
+The following is a sketch of the API imported by such a lowered component as a
+set of C functions.  Here we assume that the component explicitly creates and
+switches between thread, and thus must import intrinsics from the host to do so.
+
+```
+// Creates a new thread, initially in a "suspended" state.
+//
+// - `thread`: The identifier used to refer to the thread hereafter
+// - `context`: The value to pass to the function in the new thread
+// - `table`: The table in which to find the function
+// - `func`: The function to call, of type `(func (param i32))`
+__attribute__((__import_module__("env"), __import_name__("thread.new")))
+void thread_new(uint32_t thread, void *context, uint32_t table, uint32_t func);
+
+// Switch to the specified thread, suspending the current one.
+//
+// - `thread`: The identifier of the thread to which to switch
+__attribute__((__import_module__("env"), __import_name__("thread.switch-to")))
+void thread_switch_to(uint32_t thread);
+
+// The remaining functions listed here are (eventually) intended to match the
+// imports a C binding generator would generate per the proposed
+// [Guest C ABI](https://github.com/WebAssembly/component-model/pull/378), with
+// possible exceptions as noted.
+
+// Constructor for the _imported_ resource `thing`.
+//
+// - `handle`: The identifier used to refer to the object hereafter
+// - `v`: The constructor's `u32` parameter
+//
+// Note that the signature here differs slightly from the Guest C ABI since in
+// this scenario the guest is responsible for allocating resource handles.  We
+// _could_ make it match the Guest C ABI by having it return a handle instead of
+// taking it as a parameter, but that would require the host to reenter the
+// guest to allocate a handle before returning.
+__attribute__((__import_module__("example:package/foo"), __import_name__("[constructor]thing")))
+void import_example_package_foo_constructor_thing(uint32_t handle, uint32_t v);
+
+// `get` method for the _imported_ resource `thing`.
+//
+// - `handle`: The identifier of the object
+//
+// Returns the `u32` result.
+__attribute__((__import_module__("example:package/foo"), __import_name__("[method]thing.get")))
+uint32_t import_example_package_foo_thing_get(uint32_t handle);
+
+// Drop a borrow or own handle to an instance of the _imported_ resource `thing`.
+//
+// - `handle`: The identifier of the object
+__attribute__((__import_module__("example:package/foo"), __import_name__("[resource-drop]thing")))
+void import_example_package_foo_thing_drop(uint32_t handle);
+
+// Imported `bar` function.
+//
+// - `v_memory`: The memory to which `v_ptr` points
+// - `v_ptr`: A pointer to the UTF-8-encoded string representing the `v` parameter
+// - `v_len`: The length, in bytes of the encode string
+// - `s`: `stream<u32>` parameter
+//
+// Returns the `stream<thing>` result where `thing` is the _imported_ resource.
+__attribute__((__import_module__("example:package/foo"), __import_name__("bar")))
+uint32_t import_example_package_foo_bar(uint32_t v_memory, uint8_t *v_ptr, size_t v_len, s: uint32_t);
+```
+
+### Host->Guest API
+
+As mentioned earlier, the guest is responsible for maintaining tables to track
+resources, streams, futures, and tasks, and threads.  This means the host must
+call into the guest to allocate or dispose of such things.  In addition, the
+guest must export functions for reading from and writing to streams and futures
+where the guest holds one and and the host holds the other.
+
+As with the Guest->Host API, the exact set of functions exported by a given
+lowered component will depend on which resource, stream, and future types are
+used by the world targeted by the component, as well as which interfaces and
+functions are exported.  The following is a sketch of the API exported by the
+hypothetical lowered component we presented in the previous section:
+
+```
+// (Re)allocates from the specified guest memory.
+//
+// - `memory`: The index of the memory from which to allocate
+// - `ptr`: The previous allocation, or `NULL`
+// - `old_size`: The size of the previous allocation, if applicable
+// - `align`: The minimum alignment of the new allocation
+// - `new_size`: The minimum size of the new allocation
+//
+// Returns the new allocation, or traps on failure.
+//
+// Note that this function may become unnecessary once
+// [Lazy Lowering](https://github.com/WebAssembly/component-model/issues/383)
+// arrives.
+__attribute__((__export_name__("cabi_realloc")))
+void *cabi_realloc(uint32_t memory, void *ptr, size_t old_size, size_t align, size_t new_size);
+
+// Represents the write- and read-ends of a `stream` or `future`.
+//
+// Note that we use a currently-hypothetical `__multivalue_return__` attribute
+// here to indicate that functions returning this type should compile to a core
+// Wasm type of e.g. `(func ... (result i32 i32))`.
+__attribute((__multivalue_return__))
+typedef struct {
+  uint32_t writer;
+  uint32_t reader;
+} writer_reader_pair_t;
+
+// Constructs a new `stream<u32>`.
+//
+// Returns the (writer, reader) pair.
+__attribute__((__export_name__("stream<u32>.new")))
+writer_reader_pair_t stream_u32_new();
+
+// Constructs a new `stream<thing>`, where `thing` is the _imported_ resource.
+//
+// Returns the (writer, reader) pair.
+__attribute__((__export_name__("stream<import example:package/foo#[constructor]thing>.new")))
+writer_reader_pair_t stream_import_example_package_foo_thing_new();
+
+// Constructs a new `stream<thing>`, where `thing` is the _exported_ resource.
+//
+// Returns the (writer, reader) pair.
+__attribute__((__export_name__("stream<export example:package/foo#[constructor]thing>.new")))
+writer_reader_pair_t stream_export_example_package_foo_thing_new();
+
+// Represents the result of a stream read or write.
+//
+// Note that we use a currently-hypothetical `__multivalue_return__` attribute
+// here to indicate that functions returning this type should compile to a core
+// Wasm type of e.g. `(func ... (result i32 i32))`.
+__attribute((__multivalue_return__))
+typedef struct {
+  uint32_t result;
+  size_t count;
+} result_and_count_t;
+
+// Reads from a `stream<u32>` whose write end is owned by the guest.
+//
+// - `stream`: The identifier of the stream from which to read
+// - `memory`: The memory in which the buffer resides
+// - `buffer`: The buffer to receive the items
+// - `length`: The maximum number of items which may be received
+//
+// The return value indicates the result of the operation in the same format as
+// the return value of the `stream.read` CM intrinsic.
+__attribute__((__export_name__("stream<u32>.read")))
+result_and_count_t stream_u32_read(uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length);
+
+// As above, but for writing.
+__attribute__((__export_name__("stream<u32>.write")))
+result_and_count_t stream_u32_write(uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length);
+
+// As above, but for `stream<thing>`, where `thing` is the _imported_ resource
+// type.
+__attribute__((__export_name__("stream<import example:package/foo#thing>.read")))
+result_and_count_t stream_import_example_package_foo_thing_read(
+  uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length
+);
+
+// As above, but for writing.
+__attribute__((__export_name__("stream<import example:package/foo#thing>.write")))
+result_and_count_t stream_import_example_package_foo_thing_write(
+  uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length
+);
+
+// As above, but for `stream<thing>`, where `thing` is the _exported_ resource
+// type.
+__attribute__((__export_name__("stream<export example:package/foo#thing>.read")))
+result_and_count_t stream_export_example_package_foo_thing_read(
+  uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length
+);
+
+// As above, but for writing.
+__attribute__((__export_name__("stream<export example:package/foo#thing>.write")))
+result_and_count_t stream_export_example_package_foo_thing_write(
+  uint32_t stream, uint32_t memory, uint32_t* buffer, size_t length
+);
+
+// The remaining functions listed here are (eventually) intended to match the
+// imports a C binding generator would generate per the proposed
+// [Guest C ABI](https://github.com/WebAssembly/component-model/pull/378).
+
+// Constructor for the _exported_ resource `thing`
+//
+// - `v`: The constructor's `u32` parameter
+//
+// Returns the identifier of the newly-constructed object.
+__attribute__((__export_name__("example:package/foo#[constructor]thing")))
+uint32_t example_package_foo_constructor_thing(uint32_t v);
+
+// `get` method for the _exported_ resource `thing`
+//
+// - `handle`: The identifier of the object to be dropped.
+//
+// Returns the `u32` result.
+__attribute__((__export_name__("example:package/foo#[method]thing.get")))
+uint32_t example_package_foo_thing_get(uint32_t handle);
+
+// Destructor for the _exported_ resource `thing`
+//
+// - `handle`: The identifier of the object to be dropped.
+__attribute__((__export_name__("example:package/foo#[dtor]thing")))
+void example_package_foo_thing_dtor(uint32_t handle);
+
+// Exported `bar` function.
+//
+// - `v_memory`: The memory to which `v_ptr` points
+// - `v_ptr`: A pointer to the UTF-8-encoded string representing the `v` parameter
+// - `v_len`: The length, in bytes of the encode string
+// - `s`: `stream<u32>` parameter
+//
+// Returns the `stream<thing>` result where `thing` is the _exported_ resource.
+__attribute__((__export_name__("example:package/foo#bar")))
+uint32_t example_package_foo_bar(uint32_t v_memory, uint8_t *v_ptr, size_t v_len, s: uint32_t);
 ```
 
 ## `host-wit-bindgen`
@@ -154,16 +399,36 @@ runtime can implement to support the low-level operations required by
 - defining host functions
 - instantiating a module
 - calling a module's exports
-- reading from and writing to a module's memories and globals
+- reading from and writing to a module's memories, tables, and globals
 - creating, suspending, and resuming fibers
-- generating stack traces
-- reading and writing fiber-local state
 
 Given that a C API doesn't make sense in e.g. a web browser, this could be
 mirrored as a JS API for use in JS-embedded runtimes.
 
 ```
-(TODO: Sketch the proposed API)
+// Represents a runtime store in which one or more modules may be instantiated.
+typedef struct {
+  void *ptr;
+} store_t;
+
+// Create a new store.
+//
+// - `data`: Application-specific data to be associated with the store
+//
+// Returns the newly-created store.
+store_t new_store(void *data);
+
+// Get the application-specific data from the store.
+//
+// - `store`: The store from which the data should be retrieved
+//
+// Returns the associated data.
+void *store_data(store_t store);
+
+// Dispose of the specified store.
+void store_drop(store_t store);
+
+// tbc
 ```
 
 # Rationale and alternatives
